@@ -16,7 +16,7 @@ import streamlit as st
 # Page config
 # ─────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Deep Metadata Remover",
+    page_title="Deep Metadata Viewer & Remover",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -47,6 +47,16 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 [data-testid="stMetric"] { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:10px; padding:12px 16px; }
 [data-testid="stMetricValue"] { color:#a78bfa!important; font-weight:700!important; }
 [data-testid="stMetricLabel"] { color:#64748b!important; font-size:0.78rem!important; }
+/* tabs */
+[data-testid="stTabs"] [data-baseweb="tab-list"] { background:rgba(255,255,255,0.03); border-radius:12px; padding:4px; gap:4px; border:1px solid rgba(255,255,255,0.07); }
+[data-testid="stTabs"] [data-baseweb="tab"] { border-radius:9px; font-weight:600; font-size:0.9rem; color:#64748b; padding:8px 22px; }
+[data-testid="stTabs"] [aria-selected="true"] { background:linear-gradient(135deg,#7c3aed,#2563eb)!important; color:white!important; box-shadow:0 3px 14px rgba(124,58,237,0.4); }
+/* risk badges */
+.risk-high { color:#f87171; font-weight:600; }
+.risk-med  { color:#fbbf24; font-weight:600; }
+.risk-low  { color:#34d399; font-weight:600; }
+.risk-bar-wrap { background:rgba(255,255,255,0.06); border-radius:99px; height:8px; overflow:hidden; margin:4px 0 2px; }
+.risk-bar { height:8px; border-radius:99px; transition:width 0.6s ease; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -301,12 +311,54 @@ def clean_file(filename: str, data: bytes) -> Tuple[Optional[bytes], Dict[str, s
 # ─────────────────────────────────────────────────────────────────
 # UI helpers
 # ─────────────────────────────────────────────────────────────────
-def _meta_table(meta: Dict[str, Any]) -> str:
+
+# Fields considered high-risk for privacy
+_HIGH_RISK = {
+    "author", "creator", "producer", "manager", "company",
+    "lastmodifiedby", "lastauthor", "creationdate", "moddate",
+    "mod-date", "creation-date", "dc/creator", "core/creator",
+    "core/lastmodifiedby", "core/description", "core/subject",
+    "core/keywords", "core/title",
+    "app/company", "app/manager", "app/template",
+    "tracked revisions", "rsid fingerprints", "custom properties",
+    "xmp_raw",
+}
+_MED_RISK = {
+    "subject", "title", "keywords", "description",
+    "app/application", "app/appversion", "format",
+    "app/words", "app/pages", "app/characters",
+}
+
+
+def _risk_colour(key: str) -> str:
+    k = key.lower().strip("_")
+    if any(h in k for h in _HIGH_RISK):
+        return "#f87171"   # red
+    if any(m in k for m in _MED_RISK):
+        return "#fbbf24"   # amber
+    return "#94a3b8"       # neutral
+
+
+def _risk_score(meta: Dict[str, Any]) -> int:
+    """0-100 privacy risk score based on sensitive fields found."""
+    score = 0
+    for k, v in meta.items():
+        if not v or str(v) in ("", "0"):
+            continue
+        kl = k.lower().strip("_")
+        if any(h in kl for h in _HIGH_RISK):
+            score += 15
+        elif any(m in kl for m in _MED_RISK):
+            score += 5
+    return min(score, 100)
+
+
+def _meta_table(meta: Dict[str, Any], colour_risk: bool = False) -> str:
     if not meta:
         return '<p style="color:#64748b;font-size:0.85rem;">No metadata found.</p>'
     rows = "".join(
         f"<tr><td style='color:#94a3b8'>{k.lstrip('_')}</td>"
-        f"<td style='color:#f87171'>{v}</td></tr>"
+        f"<td style='color:{_risk_colour(k) if colour_risk else '#f87171'}'>{v}</td></tr>"
         for k, v in meta.items() if v
     )
     return f'<table class="meta-table"><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>{rows}</tbody></table>'
@@ -326,153 +378,392 @@ def _fmt(n: int) -> str:
     return f"{n/1024**2:.2f} MB"
 
 
+def _risk_bar(score: int) -> str:
+    if score >= 70:
+        colour, label = "#f87171", "HIGH RISK"
+    elif score >= 35:
+        colour, label = "#fbbf24", "MEDIUM RISK"
+    else:
+        colour, label = "#34d399", "LOW RISK"
+    return (
+        f'<div style="margin:8px 0">\''
+        f'<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+        f'<span style="font-size:0.78rem;color:#64748b">Privacy Risk Score</span>'
+        f'<span style="font-size:0.78rem;font-weight:700;color:{colour}">{score}/100 — {label}</span>'
+        f'</div>'
+        f'<div class="risk-bar-wrap">'
+        f'<div class="risk-bar" style="width:{score}%;background:{colour};"></div>'
+        f'</div></div>'
+    )
+
+
+def _docx_internals(data: bytes) -> Dict[str, str]:
+    """List all internal files in a docx zip and their sizes."""
+    out = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for info in z.infolist():
+                out[info.filename] = _fmt(info.file_size)
+    except Exception:
+        pass
+    return out
+
+
+def _pdf_internals(data: bytes) -> Dict[str, str]:
+    """Pull deeper PDF object counts."""
+    out = {}
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        out["Pages"] = str(len(reader.pages))
+        js_count = 0
+        try:
+            root = reader.trailer["/Root"]
+            if "/Names" in root:
+                names = root["/Names"]
+                if "/JavaScript" in names:
+                    js_count += 1
+        except Exception:
+            pass
+        if js_count:
+            out["Embedded JavaScript"] = f"{js_count} script block(s)"
+        annot_count = sum(
+            len(p["/Annots"]) if "/Annots" in p else 0
+            for p in reader.pages
+        )
+        if annot_count:
+            out["Annotations"] = str(annot_count)
+        out["Encrypted"] = str(reader.is_encrypted)
+        out["PDF version"] = reader.pdf_header
+    except Exception:
+        pass
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────
 # Hero
 # ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
-  <h1>🛡️ Deep Metadata Remover</h1>
-  <p>Thoroughly strip hidden metadata from PDF &amp; Word documents —
-     author info, revision history, RSID fingerprints,
+  <h1>🛡️ Deep Metadata Viewer &amp; Remover</h1>
+  <p>Inspect every hidden metadata field in your PDF &amp; Word files,
+     then strip them all — author, revision history, RSID fingerprints,
      timestamps, embedded scripts &amp; more.</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────
-# Upload
+# Tabs
 # ─────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "Drop files here",
-    type=["pdf", "docx"],
-    accept_multiple_files=True,
-    label_visibility="collapsed",
-)
+tab_view, tab_remove = st.tabs(["🔍  Metadata Viewer", "🧹  Metadata Remover"])
 
-if not uploaded:
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 1 — DEEP METADATA VIEWER
+# ══════════════════════════════════════════════════════════════════
+with tab_view:
     st.markdown("""
-    <div style="text-align:center;padding:40px 0;color:#475569;">
-      <div style="font-size:3rem;margin-bottom:12px;">📂</div>
-      <p style="margin:0;font-size:0.9rem;">
-        Upload one or more <b style="color:#a78bfa">PDF</b> or
-        <b style="color:#38bdf8">DOCX</b> files to get started
-      </p>
-      <p style="margin:6px 0 0;font-size:0.78rem;color:#334155;">
-        All processing happens locally — nothing leaves your machine
-      </p>
-    </div>
+    <p style="color:#64748b;font-size:0.88rem;margin:0 0 16px;">
+      Upload files to get a full breakdown of all metadata fields, internal
+      structure, and a privacy risk score — <b style="color:#a78bfa">before</b> any cleaning.
+    </p>
     """, unsafe_allow_html=True)
-    st.stop()
 
-# ─────────────────────────────────────────────────────────────────
-# Summary bar
-# ─────────────────────────────────────────────────────────────────
-c1, c2, c3, c4 = st.columns(4)
-with c1: st.metric("Files queued", len(uploaded))
-with c2: st.metric("Total size", _fmt(sum(f.size for f in uploaded)))
-with c3: st.metric("PDF", sum(1 for f in uploaded if f.name.lower().endswith(".pdf")))
-with c4: st.metric("DOCX", sum(1 for f in uploaded if f.name.lower().endswith(".docx")))
+    view_files = st.file_uploader(
+        "Upload files to inspect",
+        type=["pdf", "docx"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="view_upload",
+    )
 
-st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+    if not view_files:
+        st.markdown("""
+        <div style="text-align:center;padding:40px 0;color:#475569;">
+          <div style="font-size:3rem;margin-bottom:10px;">🔍</div>
+          <p style="margin:0;font-size:0.9rem;">
+            Drop <b style="color:#a78bfa">PDF</b> or
+            <b style="color:#38bdf8">DOCX</b> files to inspect their hidden metadata
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        for uf in view_files:
+            raw = uf.read()
+            meta = get_meta(uf.name, raw)
+            score = _risk_score(meta)
+            ext = os.path.splitext(uf.name)[1].upper().lstrip(".")
+            badge_col = "#a78bfa" if ext == "PDF" else "#38bdf8"
 
-# ─────────────────────────────────────────────────────────────────
-# Process
-# ─────────────────────────────────────────────────────────────────
-run = st.button("⚡ Strip All Metadata", use_container_width=True)
+            with st.expander(f"📄  {uf.name}", expanded=True):
+                # Header row
+                st.markdown(
+                    f'<span style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);'
+                    f'border-radius:6px;padding:2px 10px;font-size:0.8rem;color:{badge_col};'
+                    f'font-weight:600;margin-right:8px;">{ext}</span>'
+                    f'<span style="font-size:0.82rem;color:#475569;">{_fmt(len(raw))}</span>',
+                    unsafe_allow_html=True,
+                )
 
-if run:
-    results = []
-    prog = st.progress(0, text="Processing…")
-    for i, uf in enumerate(uploaded):
-        raw = uf.read()
-        before = get_meta(uf.name, raw)
-        cleaned, report = clean_file(uf.name, raw)
-        after = get_meta(uf.name, cleaned) if cleaned else {}
-        results.append(dict(name=uf.name, raw=raw, cleaned=cleaned,
-                            before=before, after=after, report=report))
-        prog.progress((i + 1) / len(uploaded), text=f"Done: {uf.name}")
-    prog.empty()
-    st.session_state["results"] = results
+                # Risk bar
+                st.markdown(_risk_bar(score), unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────
-# Results
-# ─────────────────────────────────────────────────────────────────
-if "results" in st.session_state:
-    results = st.session_state["results"]
-    st.markdown("### ✅ Results")
+                st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
-    for r in results:
-        name = r["name"]
-        cleaned = r["cleaned"]
-        before = r["before"]
-        after = r["after"]
-        report = r["report"]
-        ok = cleaned is not None and "_error" not in report
-        ext = os.path.splitext(name)[1].upper().lstrip(".")
-        badge_col = "#a78bfa" if ext == "PDF" else "#38bdf8"
-        chip = '<span class="chip-ok">✓ Cleaned</span>' if ok else '<span class="chip-err">✗ Failed</span>'
+                # Split: metadata + internals
+                left, right = st.columns([3, 2])
 
-        with st.expander(name, expanded=True):
-            st.markdown(
-                f'<span style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);'
-                f'border-radius:6px;padding:2px 10px;font-size:0.8rem;color:{badge_col};font-weight:600;margin-right:8px;">'
-                f'{ext}</span>{chip}',
-                unsafe_allow_html=True,
-            )
-            if ok:
-                m1, m2, m3 = st.columns(3)
-                with m1: st.metric("Original", _fmt(len(r["raw"])))
-                with m2: st.metric("Cleaned", _fmt(len(cleaned)))
-                with m3: st.metric("Saved", _fmt(abs(len(r["raw"]) - len(cleaned))))
+                with left:
+                    st.markdown("<div class='section-label'>📋 All Metadata Fields</div>", unsafe_allow_html=True)
+                    st.markdown("""
+                    <p style="font-size:0.75rem;color:#475569;margin:0 0 8px;">
+                      <span style="color:#f87171">■</span> High risk &nbsp;
+                      <span style="color:#fbbf24">■</span> Medium risk &nbsp;
+                      <span style="color:#94a3b8">■</span> Low / informational
+                    </p>
+                    """, unsafe_allow_html=True)
 
-                st.markdown("<br>", unsafe_allow_html=True)
-                b_col, a_col = st.columns(2)
-                with b_col:
-                    st.markdown("<div class='section-label'>📋 Before — metadata found</div>", unsafe_allow_html=True)
-                    st.markdown(_meta_table(before), unsafe_allow_html=True)
-                with a_col:
-                    st.markdown("<div class='section-label'>🧹 After — remaining metadata</div>", unsafe_allow_html=True)
-                    remaining = {k: v for k, v in after.items()
-                                 if v and str(v) not in ("", "0") and not k.startswith("_Page")}
-                    if remaining:
-                        st.markdown(_meta_table(remaining), unsafe_allow_html=True)
-                    else:
+                    # Separate into categories
+                    high, med, low = {}, {}, {}
+                    for k, v in meta.items():
+                        if not v:
+                            continue
+                        kl = k.lower().strip("_")
+                        if any(h in kl for h in _HIGH_RISK):
+                            high[k] = v
+                        elif any(m in kl for m in _MED_RISK):
+                            med[k] = v
+                        else:
+                            low[k] = v
+
+                    if high:
+                        rows = "".join(
+                            f"<tr><td style='color:#f87171;font-weight:600'>{k.lstrip('_')}</td>"
+                            f"<td style='color:#fca5a5'>{v}</td></tr>"
+                            for k, v in high.items()
+                        )
                         st.markdown(
-                            '<div style="text-align:center;padding:24px;background:rgba(52,211,153,0.06);'
-                            'border:1px solid rgba(52,211,153,0.2);border-radius:10px;">'
-                            '<span style="font-size:1.8rem">✨</span><br>'
-                            '<span style="color:#34d399;font-weight:600">Completely clean</span>'
-                            '</div>',
+                            f'<table class="meta-table">'
+                            f'<thead><tr><th style="color:#f87171">🔴 High Risk Field</th><th>Value</th></tr></thead>'
+                            f'<tbody>{rows}</tbody></table>',
+                            unsafe_allow_html=True,
+                        )
+                    if med:
+                        rows = "".join(
+                            f"<tr><td style='color:#fbbf24;font-weight:600'>{k.lstrip('_')}</td>"
+                            f"<td style='color:#fde68a'>{v}</td></tr>"
+                            for k, v in med.items()
+                        )
+                        st.markdown(
+                            f'<table class="meta-table" style="margin-top:10px;">'
+                            f'<thead><tr><th style="color:#fbbf24">🟡 Medium Risk Field</th><th>Value</th></tr></thead>'
+                            f'<tbody>{rows}</tbody></table>',
+                            unsafe_allow_html=True,
+                        )
+                    if low:
+                        rows = "".join(
+                            f"<tr><td style='color:#94a3b8'>{k.lstrip('_')}</td>"
+                            f"<td style='color:#cbd5e1'>{v}</td></tr>"
+                            for k, v in low.items()
+                        )
+                        st.markdown(
+                            f'<table class="meta-table" style="margin-top:10px;">'
+                            f'<thead><tr><th style="color:#64748b">⚪ Informational Field</th><th>Value</th></tr></thead>'
+                            f'<tbody>{rows}</tbody></table>',
                             unsafe_allow_html=True,
                         )
 
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown("<div class='section-label'>🔧 Operations performed</div>", unsafe_allow_html=True)
-                st.markdown(_report_table(report), unsafe_allow_html=True)
+                    if not meta:
+                        st.markdown(
+                            '<p style="color:#34d399;font-size:0.85rem;">✓ No metadata found</p>',
+                            unsafe_allow_html=True,
+                        )
 
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.download_button(
-                    label=f"⬇️  Download  {name}",
-                    data=cleaned,
-                    file_name=name,
-                    mime="application/octet-stream",
-                    key=f"dl_{name}",
-                )
-            else:
-                st.error(f"Error: {report.get('_error', 'Unknown error')}")
+                with right:
+                    st.markdown("<div class='section-label'>🗂 File Internals</div>", unsafe_allow_html=True)
+                    if ext == "DOCX":
+                        internals = _docx_internals(raw)
+                        if internals:
+                            rows = "".join(
+                                f"<tr><td style='color:#94a3b8;font-size:0.78rem'>{k}</td>"
+                                f"<td style='color:#64748b;font-size:0.78rem'>{v}</td></tr>"
+                                for k, v in internals.items()
+                            )
+                            st.markdown(
+                                f'<div style="max-height:380px;overflow-y:auto;">'
+                                f'<table class="meta-table"><thead><tr>'
+                                f'<th>Internal File</th><th>Size</th>'
+                                f'</tr></thead><tbody>{rows}</tbody></table></div>',
+                                unsafe_allow_html=True,
+                            )
+                    elif ext == "PDF":
+                        internals = _pdf_internals(raw)
+                        if internals:
+                            rows = "".join(
+                                f"<tr><td style='color:#94a3b8'>{k}</td>"
+                                f"<td style='color:#a78bfa;font-weight:600'>{v}</td></tr>"
+                                for k, v in internals.items()
+                            )
+                            st.markdown(
+                                f'<table class="meta-table"><thead><tr>'
+                                f'<th>Property</th><th>Value</th>'
+                                f'</tr></thead><tbody>{rows}</tbody></table>',
+                                unsafe_allow_html=True,
+                            )
 
-    # Bulk ZIP
-    ok_results = [(r["name"], r["cleaned"]) for r in results if r["cleaned"]]
-    if len(ok_results) > 1:
+                    # Summary counts
+                    st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+                    a, b, c = st.columns(3)
+                    with a: st.metric("High risk", len(high), delta=None)
+                    with b: st.metric("Med risk",  len(med),  delta=None)
+                    with c: st.metric("Info",      len(low),  delta=None)
+
+                    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div style="background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.2);'
+                        f'border-radius:8px;padding:10px 14px;font-size:0.82rem;color:#a78bfa;">'
+                        f'💡 Switch to the <b>Metadata Remover</b> tab to strip all of this.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 2 — METADATA REMOVER
+# ══════════════════════════════════════════════════════════════════
+with tab_remove:
+    st.markdown("""
+    <p style="color:#64748b;font-size:0.88rem;margin:0 0 16px;">
+      Upload files to deep-clean all metadata. Download the result
+      with the <b>exact same filename</b> — completely stripped.
+    </p>
+    """, unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "Drop files here",
+        type=["pdf", "docx"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="remove_upload",
+    )
+
+    if not uploaded:
+        st.markdown("""
+        <div style="text-align:center;padding:40px 0;color:#475569;">
+          <div style="font-size:3rem;margin-bottom:12px;">📂</div>
+          <p style="margin:0;font-size:0.9rem;">
+            Upload one or more <b style="color:#a78bfa">PDF</b> or
+            <b style="color:#38bdf8">DOCX</b> files to clean
+          </p>
+          <p style="margin:6px 0 0;font-size:0.78rem;color:#334155;">
+            All processing happens locally — nothing leaves your machine
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: st.metric("Files queued", len(uploaded))
+        with c2: st.metric("Total size", _fmt(sum(f.size for f in uploaded)))
+        with c3: st.metric("PDF", sum(1 for f in uploaded if f.name.lower().endswith(".pdf")))
+        with c4: st.metric("DOCX", sum(1 for f in uploaded if f.name.lower().endswith(".docx")))
+
         st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
-        zb = io.BytesIO()
-        with zipfile.ZipFile(zb, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for fname, fdata in ok_results:
-                zf.writestr(fname, fdata)
-        st.download_button(
-            label=f"📦  Download all {len(ok_results)} cleaned files as ZIP",
-            data=zb.getvalue(),
-            file_name="cleaned_files.zip",
-            mime="application/zip",
-            use_container_width=True,
-            key="dl_zip",
-        )
+
+        run = st.button("⚡ Strip All Metadata", use_container_width=True)
+
+        if run:
+            results = []
+            prog = st.progress(0, text="Processing…")
+            for i, uf in enumerate(uploaded):
+                raw = uf.read()
+                before = get_meta(uf.name, raw)
+                cleaned, report = clean_file(uf.name, raw)
+                after = get_meta(uf.name, cleaned) if cleaned else {}
+                results.append(dict(name=uf.name, raw=raw, cleaned=cleaned,
+                                    before=before, after=after, report=report))
+                prog.progress((i + 1) / len(uploaded), text=f"Done: {uf.name}")
+            prog.empty()
+            st.session_state["results"] = results
+
+        if "results" in st.session_state:
+            results = st.session_state["results"]
+            st.markdown("### ✅ Results")
+
+            for r in results:
+                name = r["name"]
+                cleaned = r["cleaned"]
+                before = r["before"]
+                after = r["after"]
+                report = r["report"]
+                ok = cleaned is not None and "_error" not in report
+                ext = os.path.splitext(name)[1].upper().lstrip(".")
+                badge_col = "#a78bfa" if ext == "PDF" else "#38bdf8"
+                chip = '<span class="chip-ok">✓ Cleaned</span>' if ok else '<span class="chip-err">✗ Failed</span>'
+
+                with st.expander(name, expanded=True):
+                    st.markdown(
+                        f'<span style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);'
+                        f'border-radius:6px;padding:2px 10px;font-size:0.8rem;color:{badge_col};font-weight:600;margin-right:8px;">'
+                        f'{ext}</span>{chip}',
+                        unsafe_allow_html=True,
+                    )
+                    if ok:
+                        before_score = _risk_score(before)
+                        after_score  = _risk_score(after)
+                        m1, m2, m3, m4 = st.columns(4)
+                        with m1: st.metric("Original", _fmt(len(r["raw"])))
+                        with m2: st.metric("Cleaned",  _fmt(len(cleaned)))
+                        with m3: st.metric("Saved",    _fmt(abs(len(r["raw"]) - len(cleaned))))
+                        with m4: st.metric("Risk score", f"{before_score} → {after_score}")
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        b_col, a_col = st.columns(2)
+                        with b_col:
+                            st.markdown("<div class='section-label'>📋 Before — metadata found</div>", unsafe_allow_html=True)
+                            st.markdown(_meta_table(before, colour_risk=True), unsafe_allow_html=True)
+                        with a_col:
+                            st.markdown("<div class='section-label'>🧹 After — remaining metadata</div>", unsafe_allow_html=True)
+                            remaining = {k: v for k, v in after.items()
+                                         if v and str(v) not in ("", "0") and not k.startswith("_Page")}
+                            if remaining:
+                                st.markdown(_meta_table(remaining, colour_risk=True), unsafe_allow_html=True)
+                            else:
+                                st.markdown(
+                                    '<div style="text-align:center;padding:24px;background:rgba(52,211,153,0.06);'
+                                    'border:1px solid rgba(52,211,153,0.2);border-radius:10px;">'
+                                    '<span style="font-size:1.8rem">✨</span><br>'
+                                    '<span style="color:#34d399;font-weight:600">Completely clean</span>'
+                                    '</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.markdown("<div class='section-label'>🔧 Operations performed</div>", unsafe_allow_html=True)
+                        st.markdown(_report_table(report), unsafe_allow_html=True)
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.download_button(
+                            label=f"⬇️  Download  {name}",
+                            data=cleaned,
+                            file_name=name,
+                            mime="application/octet-stream",
+                            key=f"dl_{name}",
+                        )
+                    else:
+                        st.error(f"Error: {report.get('_error', 'Unknown error')}")
+
+            # Bulk ZIP
+            ok_results = [(r["name"], r["cleaned"]) for r in results if r["cleaned"]]
+            if len(ok_results) > 1:
+                st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+                zb = io.BytesIO()
+                with zipfile.ZipFile(zb, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for fname, fdata in ok_results:
+                        zf.writestr(fname, fdata)
+                st.download_button(
+                    label=f"📦  Download all {len(ok_results)} cleaned files as ZIP",
+                    data=zb.getvalue(),
+                    file_name="cleaned_files.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="dl_zip",
+                )
